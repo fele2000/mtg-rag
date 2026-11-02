@@ -1,0 +1,543 @@
+{
+  "name": "MTG RAG 01 - Ingest Comprehensive Rules",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "062263dc-f975-41c3-8b11-c33a8f678bae",
+      "name": "Manual trigger",
+      "position": [
+        0,
+        0
+      ],
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "jsCode": "// Config: edit these values once. Every other node reads them via $('Config').first().json\n// If n8n runs in Docker and Neo4j/Ollama run on the host, use host.docker.internal.\n// If n8n runs directly on Windows (npm / desktop), use localhost.\nreturn [{\n  json: {\n    neo4j_url: 'http://host.docker.internal:7474',\n    neo4j_db: 'neo4j',\n    ollama_url: 'http://host.docker.internal:11434',\n    embed_model: 'nomic-embed-text',\n    // Scryfall set code(s) to ingest. One set is ~250-300 cards. Space separated for several: 'fdn dsk'\n    set_codes: 'fdn',\n    // Paste the current TXT link from https://magic.wizards.com/en/rules\n    cr_url: 'https://media.wizards.com/2026/downloads/MagicCompRules 20260619.txt',\n  },\n}];\n"
+      },
+      "id": "e7d41e9d-f2df-44c1-97d1-a4bd7dc986db",
+      "name": "Config",
+      "position": [
+        240,
+        128
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Config').first().json.cr_url }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "0c9a5586-a678-4580-aee1-612ff14e0e68",
+      "name": "Download Comprehensive Rules",
+      "position": [
+        480,
+        0
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2
+    },
+    {
+      "parameters": {
+        "jsCode": "// Splits the Comprehensive Rules TXT into one chunk per numbered rule (e.g. 702.19 incl. 702.19a-e).\n// Rules longer than MAX characters are split on line boundaries into #1, #2, ...\nconst MAX = 3500;\n\nfunction fnv1a(str) {\n  let h = 0x811c9dc5;\n  for (let i = 0; i < str.length; i++) {\n    h ^= str.charCodeAt(i);\n    h = Math.imul(h, 0x01000193) >>> 0;\n  }\n  return h.toString(16).padStart(8, '0');\n}\n\nconst raw = String($input.first().json.data ?? '').replace(/^﻿/, '').replace(/\\r/g, '');\nconst lines = raw.split('\\n').map(l => l.trim());\nconst version = (raw.match(/effective as of ([^.\\n]+)/i) ?? [])[1]?.trim() ?? 'unknown';\n\nconst start = lines.findIndex(l => /^100\\.1\\. /.test(l));\nif (start < 0) throw new Error('Rule 100.1 not found - is cr_url pointing at the Comprehensive Rules TXT?');\nlet end = lines.findIndex((l, i) => i > start && l === 'Glossary');\nif (end < 0) end = lines.length;\n\n// Section titles (\"702. Keyword Abilities\") from the table of contents and the body\nconst sections = {};\nfor (const l of lines.slice(0, end)) {\n  const m = l.match(/^(\\d{3})\\. (.+)$/);\n  if (m) sections[m[1]] = m[2];\n}\n\nconst rules = [];\nlet cur = null;\nfor (const l of lines.slice(start, end)) {\n  if (!l) continue;\n  if (/^\\d\\. [A-Z]/.test(l) || /^\\d{3}\\. /.test(l)) { cur = null; continue; } // chapter / section headers\n  const m = l.match(/^(\\d{3})\\.(\\d+)\\. (.+)$/);\n  if (m) {\n    cur = { number: `${m[1]}.${m[2]}`, section: m[1], heading: m[3], lines: [l] };\n    rules.push(cur);\n    continue;\n  }\n  if (cur) cur.lines.push(l); // subrules like 702.19a and \"Example:\" lines\n}\n\nconst out = [];\nfor (const r of rules) {\n  // Keyword rules have a bare title (\"Trample\"); normal rules are full sentences ending with '.'\n  const title = r.heading.endsWith('.') ? null : r.heading;\n  const sectionTitle = sections[r.section] ?? null;\n  const header = `Comprehensive Rules > ${r.section}. ${sectionTitle ?? ''} > ${r.number}${title ? ' ' + title : ''}`;\n\n  const parts = [];\n  let buf = [];\n  let len = 0;\n  for (const l of r.lines) {\n    if (buf.length && len + l.length > MAX) { parts.push(buf); buf = []; len = 0; }\n    buf.push(l);\n    len += l.length + 1;\n  }\n  if (buf.length) parts.push(buf);\n\n  parts.forEach((p, idx) => {\n    const text = `${header}\\n${p.join('\\n')}`;\n    out.push({\n      json: {\n        chunk_id: `rule:${r.number}${parts.length > 1 ? '#' + (idx + 1) : ''}`,\n        source_type: 'rule',\n        parent_id: r.number,\n        number: r.number,\n        section: r.section,\n        section_title: sectionTitle,\n        title,\n        cr_version: version,\n        text,\n        hash: fnv1a(text),\n        source: `Magic Comprehensive Rules (effective ${version}), rule ${r.number}`,\n      },\n    });\n  });\n}\n\nreturn out;\n"
+      },
+      "id": "f669f3ce-63a3-4296-8d61-e5582432e39c",
+      "name": "Chunk rules",
+      "position": [
+        720,
+        128
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "notesInFlow": true,
+      "notes": "1 chunk per numbered rule"
+    },
+    {
+      "parameters": {
+        "jsCode": "// One row per rule (chunks split into #1/#2 share the same Rule node).\nconst STATEMENT = \"UNWIND $rows AS row\\nMERGE (s:Rule {number: row.section})\\nSET s.title = row.section_title, s.level = 'section'\\nMERGE (r:Rule {number: row.number})\\nSET r.title = row.title, r.section = row.section, r.level = 'rule', r.cr_version = row.cr_version\\nMERGE (r)-[:SUBRULE_OF]->(s)\";\nconst BATCH = 200;\n\nconst byNumber = new Map();\nfor (const { json: c } of $input.all()) {\n  if (!byNumber.has(c.number)) {\n    byNumber.set(c.number, {\n      number: c.number, section: c.section, section_title: c.section_title,\n      title: c.title, cr_version: c.cr_version,\n    });\n  }\n}\nconst rows = [...byNumber.values()];\nconst out = [];\nfor (let i = 0; i < rows.length; i += BATCH) {\n  out.push({ json: { statements: [{ statement: STATEMENT, parameters: { rows: rows.slice(i, i + BATCH) } }] } });\n}\nreturn out;\n"
+      },
+      "id": "f83fdc3e-068e-41bc-a9b9-aa7e416cf25b",
+      "name": "Build rule node batches",
+      "position": [
+        960,
+        0
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.neo4j_url }}/db/{{ $('Config').first().json.neo4j_db }}/tx/commit",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "794c8333-234c-46f9-bb20-762a3139142e",
+      "name": "Neo4j: upsert rules",
+      "position": [
+        1200,
+        128
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "notesInFlow": true,
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "bcmktgaXWGWFyyx6",
+          "name": "Neo4j Local"
+        }
+      },
+      "notes": "Rule graph"
+    },
+    {
+      "parameters": {
+        "jsCode": "// The Neo4j HTTP API returns 200 even when Cypher fails, so fail loudly here.\nfor (const item of $input.all()) {\n  const errors = item.json.errors ?? [];\n  if (errors.length) throw new Error('Neo4j error: ' + JSON.stringify(errors));\n}\nreturn [{ json: { ok: true, batches: $input.all().length } }];\n"
+      },
+      "id": "c2210b0a-69cd-419f-b462-f22fe703aaf2",
+      "name": "Check rules import",
+      "position": [
+        1440,
+        0
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "jsCode": "return $('Chunk rules').all().map(i => ({ json: i.json }));\n"
+      },
+      "id": "9c0f52b8-4f82-4ded-8c51-bfa687821751",
+      "name": "Back to rule chunks",
+      "position": [
+        1680,
+        128
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "jsCode": "// Duplicate check: ask Neo4j which chunks already exist and with which content hash.\nconst ids = $input.all().map(i => i.json.chunk_id);\nreturn [{\n  json: {\n    statements: [{\n      statement: 'MATCH (ch:Chunk) WHERE ch.id IN $ids RETURN ch.id AS id, ch.hash AS hash',\n      parameters: { ids },\n    }],\n  },\n}];\n"
+      },
+      "id": "62bb70d4-7d00-4a3f-ad2d-f8bf3c532040",
+      "name": "Build hash query",
+      "position": [
+        1920,
+        0
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.neo4j_url }}/db/{{ $('Config').first().json.neo4j_db }}/tx/commit",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "db791b3f-901b-494f-8172-ab29dc09b910",
+      "name": "Neo4j: existing hashes",
+      "position": [
+        2160,
+        128
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "notesInFlow": true,
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "bcmktgaXWGWFyyx6",
+          "name": "Neo4j Local"
+        }
+      },
+      "notes": "Duplicate check"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Keep only new chunks or chunks whose text changed. Unchanged chunks are not re-embedded.\nconst res = $input.first().json;\nif (res.errors?.length) throw new Error('Neo4j error: ' + JSON.stringify(res.errors));\nconst existing = new Map((res.results?.[0]?.data ?? []).map(d => [d.row[0], d.row[1]]));\n\nconst chunks = $(\"Back to rule chunks\").all().map(i => i.json);\nconst changed = chunks.filter(c => existing.get(c.chunk_id) !== c.hash);\nconst skipped = chunks.length - changed.length;\nconsole.log(`Chunks: ${chunks.length}, unchanged (skipped): ${skipped}, to embed: ${changed.length}`);\nreturn changed.map(c => ({ json: c }));\n"
+      },
+      "id": "f76d08aa-7578-4694-be6d-59ddb2cb0366",
+      "name": "Filter changed chunks",
+      "position": [
+        2400,
+        0
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "notesInFlow": true,
+      "notes": "Skips chunks whose hash is unchanged"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.ollama_url }}/api/embed",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $('Config').first().json.embed_model, input: $json.inputs }) }}",
+        "options": {}
+      },
+      "id": "72af2079-4e9b-4150-a4ee-f01037c65fcf",
+      "name": "Ollama: embed",
+      "position": [
+        2640,
+        128
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "notesInFlow": true,
+      "retryOnFail": true,
+      "waitBetweenTries": 3000,
+      "notes": "nomic-embed-text expects the 'search_document: ' prefix"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Each Ollama response holds 32 embeddings; flatten them back onto the chunks in order\nconst chunks = $('Filter changed chunks').all().map(i => i.json);\nconst embeddings = $input.all().flatMap(i => i.json.embeddings ?? []);\nif (embeddings.length !== chunks.length) {\n  throw new Error(`Got ${embeddings.length} embeddings for ${chunks.length} chunks`);\n}\nreturn chunks.map((c, idx) => ({ json: { ...c, embedding: embeddings[idx] } }));"
+      },
+      "id": "bdfa9056-0276-4f82-ac1b-71e393de618c",
+      "name": "Attach embeddings",
+      "position": [
+        2880,
+        0
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "jsCode": "// Upserts chunks with their embedding. Label and parent link depend on the chunk type.\nconst BASE = \"UNWIND $rows AS row\\nMERGE (ch:Chunk {id: row.chunk_id})\\nSET ch:__LABEL__, ch.text = row.text, ch.source = row.source,\\n    ch.source_type = row.source_type, ch.hash = row.hash\\nWITH ch, row\\nCALL db.create.setNodeVectorProperty(ch, 'embedding', row.embedding)\\nWITH ch, row\\n__LINK__\";\nconst LABEL = { card: 'CardChunk', ruling: 'RulingChunk', rule: 'RuleChunk' };\nconst LINK = {\n  card: 'MATCH (p:Card {oracle_id: row.parent_id}) MERGE (p)-[:HAS_CHUNK]->(ch)',\n  ruling: 'MATCH (p:Card {oracle_id: row.parent_id}) MERGE (p)-[:HAS_RULINGS]->(ch)',\n  rule: 'MATCH (p:Rule {number: row.parent_id}) MERGE (p)-[:HAS_CHUNK]->(ch)',\n};\nconst BATCH = 50;\n\nconst byType = {};\nfor (const { json: c } of $input.all()) {\n  (byType[c.source_type] ??= []).push({\n    chunk_id: c.chunk_id, parent_id: c.parent_id, source_type: c.source_type,\n    text: c.text, hash: c.hash, source: c.source, embedding: c.embedding,\n  });\n}\n\nconst out = [];\nfor (const [type, rows] of Object.entries(byType)) {\n  const statement = BASE.replace('__LABEL__', LABEL[type]).replace('__LINK__', LINK[type]);\n  for (let i = 0; i < rows.length; i += BATCH) {\n    out.push({ json: { statements: [{ statement, parameters: { rows: rows.slice(i, i + BATCH) } }] } });\n  }\n}\nreturn out;\n"
+      },
+      "id": "0b605412-10a3-4768-a6fb-07f97b7fdf50",
+      "name": "Build chunk batches",
+      "position": [
+        3120,
+        128
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.neo4j_url }}/db/{{ $('Config').first().json.neo4j_db }}/tx/commit",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "22d0d155-34c4-4f7c-9d12-4b2b5a433a81",
+      "name": "Neo4j: upsert chunks",
+      "position": [
+        3360,
+        0
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "notesInFlow": true,
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "bcmktgaXWGWFyyx6",
+          "name": "Neo4j Local"
+        }
+      },
+      "notes": "Chunk + vector"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Links Keyword nodes (from Scryfall) to the Comprehensive Rule that defines them (701.x / 702.x).\nfor (const item of $input.all()) {\n  if (item.json.errors?.length) throw new Error('Neo4j error: ' + JSON.stringify(item.json.errors));\n}\nreturn [{ json: { statements: [{ statement: \"MATCH (k:Keyword)\\nMATCH (r:Rule {level: 'rule'})\\nWHERE r.section IN ['701', '702'] AND toLower(r.title) = toLower(k.name)\\nMERGE (k)-[:DEFINED_BY]->(r)\\nRETURN count(*) AS linked\", parameters: {} }] } }];\n"
+      },
+      "id": "6053525b-45b6-46e0-b2b2-88224c5d213a",
+      "name": "Build keyword links",
+      "position": [
+        3600,
+        128
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.neo4j_url }}/db/{{ $('Config').first().json.neo4j_db }}/tx/commit",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "bbaee271-d0ab-4971-9e9d-bbaa3313e28b",
+      "name": "Neo4j: link keywords",
+      "position": [
+        3840,
+        0
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "notesInFlow": true,
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "bcmktgaXWGWFyyx6",
+          "name": "Neo4j Local"
+        }
+      },
+      "notes": "Keyword -[:DEFINED_BY]-> Rule"
+    },
+    {
+      "parameters": {
+        "jsCode": "// The Neo4j HTTP API returns 200 even when Cypher fails, so fail loudly here.\nfor (const item of $input.all()) {\n  const errors = item.json.errors ?? [];\n  if (errors.length) throw new Error('Neo4j error: ' + JSON.stringify(errors));\n}\nreturn [{ json: { ok: true, batches: $input.all().length } }];\n"
+      },
+      "id": "2b72278d-6fd6-4836-b682-1def54086fa8",
+      "name": "Check result",
+      "position": [
+        4080,
+        128
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "jsCode": "// 32 texts per request instead of one request per chunk\nconst BATCH = 32;\nconst chunks = $input.all().map(i => i.json);\nconst out = [];\nfor (let i = 0; i < chunks.length; i += BATCH) {\n  out.push({ json: { inputs: chunks.slice(i, i + BATCH).map(c => 'search_document: ' + c.text) } });\n}\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        -128
+      ],
+      "id": "44bc24d3-5dc5-4a21-905a-d34abac26a53",
+      "name": "Code in JavaScript"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Manual trigger": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Download Comprehensive Rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Comprehensive Rules": {
+      "main": [
+        [
+          {
+            "node": "Chunk rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chunk rules": {
+      "main": [
+        [
+          {
+            "node": "Build rule node batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build rule node batches": {
+      "main": [
+        [
+          {
+            "node": "Neo4j: upsert rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Neo4j: upsert rules": {
+      "main": [
+        [
+          {
+            "node": "Check rules import",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check rules import": {
+      "main": [
+        [
+          {
+            "node": "Back to rule chunks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Back to rule chunks": {
+      "main": [
+        [
+          {
+            "node": "Build hash query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build hash query": {
+      "main": [
+        [
+          {
+            "node": "Neo4j: existing hashes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Neo4j: existing hashes": {
+      "main": [
+        [
+          {
+            "node": "Filter changed chunks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter changed chunks": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama: embed": {
+      "main": [
+        [
+          {
+            "node": "Attach embeddings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach embeddings": {
+      "main": [
+        [
+          {
+            "node": "Build chunk batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build chunk batches": {
+      "main": [
+        [
+          {
+            "node": "Neo4j: upsert chunks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Neo4j: upsert chunks": {
+      "main": [
+        [
+          {
+            "node": "Build keyword links",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build keyword links": {
+      "main": [
+        [
+          {
+            "node": "Neo4j: link keywords",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Neo4j: link keywords": {
+      "main": [
+        [
+          {
+            "node": "Check result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Ollama: embed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "a62f73ad-7b0c-445d-828c-db388ff3f085",
+  "meta": {
+    "instanceId": "2e9c9501df3fd0f4eebf9dce3f5b602ad2290cf435f1b64b869057ca43185f61"
+  },
+  "nodeGroups": [],
+  "id": "jVFaVNwkDf7MSL8p",
+  "tags": []
+}

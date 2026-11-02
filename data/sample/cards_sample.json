@@ -1,0 +1,110 @@
+[
+  {
+    "card": {
+      "mana_value": 2,
+      "types": [
+        "Instant"
+      ],
+      "oracle_id": "f9db72dc-9a5b-48a4-a86e-7464d9a2166a",
+      "set": "fdn",
+      "keywords": [
+
+      ],
+      "oracle_text": "Choose one —\n• Abrade deals 3 damage to target creature.\n• Destroy target artifact.",
+      "type_line": "Instant",
+      "legal_in": [
+        "standard",
+        "pioneer",
+        "modern",
+        "legacy",
+        "vintage",
+        "commander",
+        "pauper"
+      ],
+      "colors": [
+        "R"
+      ],
+      "subtypes": [
+
+      ],
+      "scryfall_uri": "https://scryfall.com/card/fdn/188/abrade?utm_source=api",
+      "mana_cost": "{1}{R}",
+      "name": "Abrade",
+      "power": null,
+      "toughness": null,
+      "rarity": "uncommon"
+    }
+  },
+  {
+    "card": {
+      "mana_value": 5,
+      "types": [
+        "Artifact"
+      ],
+      "oracle_id": "9a02a9a7-39d9-4763-85d3-747a0540b60b",
+      "set": "fdn",
+      "keywords": [
+
+      ],
+      "oracle_text": "{T}: Add three mana of any one color.",
+      "type_line": "Artifact",
+      "legal_in": [
+        "standard",
+        "pioneer",
+        "modern",
+        "legacy",
+        "vintage",
+        "commander"
+      ],
+      "colors": [
+
+      ],
+      "subtypes": [
+
+      ],
+      "scryfall_uri": "https://scryfall.com/card/fdn/725/gilded-lotus?utm_source=api",
+      "mana_cost": "{5}",
+      "name": "Gilded Lotus",
+      "power": null,
+      "toughness": null,
+      "rarity": "rare"
+    }
+  },
+  {
+    "card": {
+      "mana_value": 3,
+      "types": [
+        "Creature"
+      ],
+      "oracle_id": "db794af5-ba2e-4b10-b213-e481e8a50432",
+      "set": "fdn",
+      "keywords": [
+        "Trample"
+      ],
+      "oracle_text": "Trample (This creature can deal excess combat damage to the player or planeswalker it's attacking.)\nWhenever another creature you control enters, this creature gets +1/+0 until end of turn.",
+      "type_line": "Creature — Elf Ranger",
+      "legal_in": [
+        "standard",
+        "pioneer",
+        "modern",
+        "legacy",
+        "vintage",
+        "commander",
+        "pauper"
+      ],
+      "colors": [
+        "G"
+      ],
+      "subtypes": [
+        "Elf",
+        "Ranger"
+      ],
+      "scryfall_uri": "https://scryfall.com/card/fdn/100/beast-kin-ranger?utm_source=api",
+      "mana_cost": "{2}{G}",
+      "name": "Beast-Kin Ranger",
+      "power": "3",
+      "toughness": "3",
+      "rarity": "common"
+    }
+  }
+]

@@ -1,0 +1,44 @@
+[
+  {
+    "chunk": {
+      "embedding_dimensions": 768,
+      "hash": "e572c5da",
+      "id": "rule:702.2",
+      "labels": [
+        "Chunk",
+        "RuleChunk"
+      ],
+      "source": "Magic Comprehensive Rules (effective June 19, 2026), rule 702.2",
+      "source_type": "rule",
+      "text": "Comprehensive Rules > 702. Keyword Abilities > 702.2 Deathtouch\n702.2. Deathtouch\n702.2a Deathtouch is a static ability.\n702.2b A creature with toughness greater than 0 that’s been dealt damage by a source with deathtouch since the last time state-based actions were checked is destroyed as a state-based action. See rule 704.\n702.2c Any nonzero amount of combat damage assigned to a creature by a source with deathtouch is considered to be lethal damage for the purposes of determining if excess damage is being dealt.\n702.2d The deathtouch rules function no matter what zone an object with deathtouch deals damage from.\n702.2e If an object is no longer in the zone it’s expected to be in as an effect causes it to deal damage, its last known information is used to determine whether it had deathtouch.\n702.2f Multiple instances of deathtouch on the same object are redundant."
+    }
+  },
+  {
+    "chunk": {
+      "embedding_dimensions": 768,
+      "hash": "9b3ef450",
+      "id": "rulings:3a2bb47d-228d-499e-a34b-9e10d99e9b2c",
+      "labels": [
+        "Chunk",
+        "RulingChunk"
+      ],
+      "source": "Scryfall rulings: Fog Bank (https://scryfall.com/card/fdn/591/fog-bank?utm_source=api)",
+      "source_type": "ruling",
+      "text": "Official rulings for Fog Bank:\n- (2024-11-08) Fog Bank's prevention effect isn't considered while assigning combat damage from a creature with trample. For example, if it blocks a 5/5 creature with trample, that creature's controller must assign 2 of that creature's combat damage to Fog Bank and the remainder can be assigned to the defending player, planeswalker, or battle."
+    }
+  },
+  {
+    "chunk": {
+      "embedding_dimensions": 768,
+      "hash": "50286603",
+      "id": "card:db794af5-ba2e-4b10-b213-e481e8a50432",
+      "labels": [
+        "Chunk",
+        "CardChunk"
+      ],
+      "source": "Scryfall: Beast-Kin Ranger (https://scryfall.com/card/fdn/100/beast-kin-ranger?utm_source=api)",
+      "source_type": "card",
+      "text": "Beast-Kin Ranger {2}{G}\nCreature — Elf Ranger\nTrample (This creature can deal excess combat damage to the player or planeswalker it's attacking.)\nWhenever another creature you control enters, this creature gets +1/+0 until end of turn.\n3/3\nSet: Foundations (FDN)"
+    }
+  }
+]

@@ -1,0 +1,192 @@
+{
+  "name": "MTG RAG tool - query_cards (graph)",
+  "nodes": [
+    {
+      "parameters": {
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "colors"
+            },
+            {
+              "name": "exact_colors"
+            },
+            {
+              "name": "type"
+            },
+            {
+              "name": "subtype"
+            },
+            {
+              "name": "keyword"
+            },
+            {
+              "name": "min_mana_value"
+            },
+            {
+              "name": "max_mana_value"
+            },
+            {
+              "name": "rarity"
+            },
+            {
+              "name": "set"
+            },
+            {
+              "name": "format"
+            },
+            {
+              "name": "text_contains"
+            },
+            {
+              "name": "limit"
+            }
+          ]
+        }
+      },
+      "id": "a53ee407-05e6-4dcc-a38e-a3a7d847422a",
+      "name": "Start",
+      "position": [
+        0,
+        0
+      ],
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1
+    },
+    {
+      "parameters": {
+        "jsCode": "// Config: edit these values once. Every other node reads them via $('Config').first().json\n// If n8n runs in Docker and Neo4j/Ollama run on the host, use host.docker.internal.\n// If n8n runs directly on Windows (npm / desktop), use localhost.\nreturn [{\n  json: {\n    neo4j_url: 'http://host.docker.internal:7474',\n    neo4j_db: 'neo4j',\n    ollama_url: 'http://host.docker.internal:11434',\n    embed_model: 'nomic-embed-text',\n    // Scryfall set code(s) to ingest. One set is ~250-300 cards. Space separated for several: 'fdn dsk'\n    set_codes: 'fdn',\n    // Paste the current TXT link from https://magic.wizards.com/en/rules\n    cr_url: 'PASTE_COMPREHENSIVE_RULES_TXT_URL_HERE',\n  },\n}];\n"
+      },
+      "id": "3df484d0-f307-48b5-b286-954df928f412",
+      "name": "Config",
+      "position": [
+        240,
+        128
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $('Start').first().json;\nconst s = v => (v === undefined || v === null || String(v).trim() === '' ? null : String(v).trim());\nconst n = v => (s(v) === null || isNaN(Number(v)) ? null : Number(v));\nconst params = {\n  type: s(input.type), subtype: s(input.subtype), keyword: s(input.keyword),\n  min_mv: n(input.min_mana_value), max_mv: n(input.max_mana_value),\n  colors: (s(input.colors) ?? '').toUpperCase().replace(/[^WUBRG]/g, '').split('').filter(Boolean),\n  exact_colors: String(input.exact_colors).toLowerCase() === 'true',\n  rarity: s(input.rarity), set: s(input.set), format: s(input.format), text: s(input.text_contains),\n  limit: Math.min(Math.max(parseInt(input.limit) || 15, 1), 40),\n};\nconst statement = \"MATCH (c:Card)\\nWHERE ($type IS NULL OR EXISTS { MATCH (c)-[:IS_TYPE]->(t:CardType) WHERE toLower(t.name) = toLower($type) })\\n  AND ($subtype IS NULL OR EXISTS { MATCH (c)-[:HAS_SUBTYPE]->(st:Subtype) WHERE toLower(st.name) = toLower($subtype) })\\n  AND ($keyword IS NULL OR EXISTS { MATCH (c)-[:HAS_KEYWORD]->(kw:Keyword) WHERE toLower(kw.name) = toLower($keyword) })\\n  AND ($min_mv IS NULL OR c.mana_value >= $min_mv)\\n  AND ($max_mv IS NULL OR c.mana_value <= $max_mv)\\n  AND (size($colors) = 0 OR ALL(x IN $colors WHERE EXISTS { MATCH (c)-[:HAS_COLOR]->(:Color {code: x}) }))\\n  AND (NOT $exact_colors OR COUNT { (c)-[:HAS_COLOR]->(:Color) } = size($colors))\\n  AND ($rarity IS NULL OR c.rarity = toLower($rarity))\\n  AND ($set IS NULL OR EXISTS { MATCH (c)-[:PRINTED_IN]->(s:Set) WHERE s.code = toLower($set) })\\n  AND ($format IS NULL OR EXISTS { MATCH (c)-[:LEGAL_IN]->(f:Format) WHERE f.name = toLower($format) })\\n  AND ($text IS NULL OR toLower(c.oracle_text) CONTAINS toLower($text))\\nWITH c ORDER BY c.mana_value, c.name\\nWITH collect(c) AS cards\\nRETURN size(cards) AS total_matches,\\n       [x IN cards[0..$limit] | {\\n          name: x.name, mana_cost: x.mana_cost, type_line: x.type_line,\\n          oracle_text: x.oracle_text, power: x.power, toughness: x.toughness,\\n          rarity: x.rarity, source: x.scryfall_uri\\n       }] AS cards\";\nreturn [{ json: { statements: [{ statement, parameters: params }] } }];\n"
+      },
+      "id": "796f703e-f427-47d3-b620-ffc8639ec9cc",
+      "name": "Build query",
+      "position": [
+        480,
+        0
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.neo4j_url }}/db/{{ $('Config').first().json.neo4j_db }}/tx/commit",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "a27306ef-dd61-41fd-a5f1-a4637dfaf250",
+      "name": "Neo4j: query",
+      "position": [
+        720,
+        128
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "bcmktgaXWGWFyyx6",
+          "name": "Neo4j Local"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turns the Neo4j HTTP response into plain objects for the agent.\nconst res = $input.first().json;\nif (res.errors?.length) throw new Error('Neo4j error: ' + JSON.stringify(res.errors));\nconst r = res.results[0];\nlet rows = r.data.map(d => Object.fromEntries(r.columns.map((c, i) => [c, d.row[i]])));\nif (rows.length && 'score' in rows[0]) rows.sort((a, b) => b.score - a.score);\nreturn [{ json: { count: rows.length, results: rows } }];\n"
+      },
+      "id": "d9457053-7514-4e82-a754-ce970fb6fa97",
+      "name": "Format result",
+      "position": [
+        960,
+        0
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    }
+  ],
+  "pinData": {
+    "Start": [
+      {
+        "json": {
+          "colors": "G",
+          "type": "Creature",
+          "keyword": "Trample",
+          "max_mana_value": "3"
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Start": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Build query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build query": {
+      "main": [
+        [
+          {
+            "node": "Neo4j: query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Neo4j: query": {
+      "main": [
+        [
+          {
+            "node": "Format result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "fbc2f8dc-1111-4a33-92cf-bdbee126abc6",
+  "meta": {
+    "instanceId": "2e9c9501df3fd0f4eebf9dce3f5b602ad2290cf435f1b64b869057ca43185f61"
+  },
+  "nodeGroups": [],
+  "id": "1z6ufizFa3BAuYFj",
+  "tags": []
+}

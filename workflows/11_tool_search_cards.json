@@ -1,0 +1,192 @@
+{
+  "name": "MTG RAG tool - search_cards (vector)",
+  "nodes": [
+    {
+      "parameters": {
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "query"
+            },
+            {
+              "name": "k",
+              "type": "number"
+            }
+          ]
+        }
+      },
+      "id": "59e343a3-2428-4135-9e6d-3c43822fce6c",
+      "name": "Start",
+      "position": [
+        0,
+        0
+      ],
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1
+    },
+    {
+      "parameters": {
+        "jsCode": "// Config: edit these values once. Every other node reads them via $('Config').first().json\n// If n8n runs in Docker and Neo4j/Ollama run on the host, use host.docker.internal.\n// If n8n runs directly on Windows (npm / desktop), use localhost.\nreturn [{\n  json: {\n    neo4j_url: 'http://host.docker.internal:7474',\n    neo4j_db: 'neo4j',\n    ollama_url: 'http://host.docker.internal:11434',\n    embed_model: 'nomic-embed-text',\n    // Scryfall set code(s) to ingest. One set is ~250-300 cards. Space separated for several: 'fdn dsk'\n    set_codes: 'fdn',\n    // Paste the current TXT link from https://magic.wizards.com/en/rules\n    cr_url: 'PASTE_COMPREHENSIVE_RULES_TXT_URL_HERE',\n  },\n}];\n"
+      },
+      "id": "041cb2f7-fbb1-4332-8510-1d89846d71f8",
+      "name": "Config",
+      "position": [
+        240,
+        128
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.ollama_url }}/api/embed",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $('Config').first().json.embed_model, input: 'search_query: ' + $('Start').first().json.query }) }}",
+        "options": {}
+      },
+      "id": "defe3c91-9473-43e0-a378-bed5b12ab0b0",
+      "name": "Ollama: embed query",
+      "position": [
+        480,
+        0
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "notesInFlow": true,
+      "notes": "nomic-embed-text expects the 'search_query: ' prefix"
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $('Start').first().json;\nconst k = Math.min(Math.max(parseInt(input.k) || 5, 1), 15);\nconst params = { k, embedding: $input.first().json.embeddings[0] };\nconst statement = \"CALL db.index.vector.queryNodes('card_chunk_embedding', $k, $embedding) YIELD node, score\\nMATCH (c:Card)-[:HAS_CHUNK]->(node)\\nRETURN c.name AS name, node.text AS text, round(score, 3) AS score, c.scryfall_uri AS source\\nORDER BY score DESC\";\nreturn [{ json: { statements: [{ statement, parameters: params }] } }];\n"
+      },
+      "id": "8161601e-7c86-4303-80d7-dd78c5dd8580",
+      "name": "Build query",
+      "position": [
+        720,
+        128
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.neo4j_url }}/db/{{ $('Config').first().json.neo4j_db }}/tx/commit",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "9a642ff8-8f9a-4ff4-8698-9a7aea24cd54",
+      "name": "Neo4j: query",
+      "position": [
+        960,
+        0
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "bcmktgaXWGWFyyx6",
+          "name": "Neo4j Local"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turns the Neo4j HTTP response into plain objects for the agent.\nconst res = $input.first().json;\nif (res.errors?.length) throw new Error('Neo4j error: ' + JSON.stringify(res.errors));\nconst r = res.results[0];\nlet rows = r.data.map(d => Object.fromEntries(r.columns.map((c, i) => [c, d.row[i]])));\nif (rows.length && 'score' in rows[0]) rows.sort((a, b) => b.score - a.score);\nreturn [{ json: { count: rows.length, results: rows } }];\n"
+      },
+      "id": "4623bcd9-7ff4-4b35-9be4-3e59e729c2fb",
+      "name": "Format result",
+      "position": [
+        1200,
+        128
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    }
+  ],
+  "pinData": {
+    "Start": [
+      {
+        "json": {
+          "query": "creature that taps to add green mana",
+          "k": 5
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Start": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Ollama: embed query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama: embed query": {
+      "main": [
+        [
+          {
+            "node": "Build query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build query": {
+      "main": [
+        [
+          {
+            "node": "Neo4j: query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Neo4j: query": {
+      "main": [
+        [
+          {
+            "node": "Format result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "85949f84-9244-488a-8133-a0098a074811",
+  "meta": {
+    "instanceId": "2e9c9501df3fd0f4eebf9dce3f5b602ad2290cf435f1b64b869057ca43185f61"
+  },
+  "nodeGroups": [],
+  "id": "Q4DfBJHOHhkNbARg",
+  "tags": []
+}

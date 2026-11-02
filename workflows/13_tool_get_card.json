@@ -1,0 +1,156 @@
+{
+  "name": "MTG RAG tool - get_card (graph)",
+  "nodes": [
+    {
+      "parameters": {
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "name"
+            }
+          ]
+        }
+      },
+      "id": "746f021c-c648-4fb5-b3f5-3c619269aaaf",
+      "name": "Start",
+      "position": [
+        0,
+        0
+      ],
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1
+    },
+    {
+      "parameters": {
+        "jsCode": "// Config: edit these values once. Every other node reads them via $('Config').first().json\n// If n8n runs in Docker and Neo4j/Ollama run on the host, use host.docker.internal.\n// If n8n runs directly on Windows (npm / desktop), use localhost.\nreturn [{\n  json: {\n    neo4j_url: 'http://host.docker.internal:7474',\n    neo4j_db: 'neo4j',\n    ollama_url: 'http://host.docker.internal:11434',\n    embed_model: 'nomic-embed-text',\n    // Scryfall set code(s) to ingest. One set is ~250-300 cards. Space separated for several: 'fdn dsk'\n    set_codes: 'fdn',\n    // Paste the current TXT link from https://magic.wizards.com/en/rules\n    cr_url: 'PASTE_COMPREHENSIVE_RULES_TXT_URL_HERE',\n  },\n}];\n"
+      },
+      "id": "247dbbf0-3601-428d-98b8-8c12aff4c4f8",
+      "name": "Config",
+      "position": [
+        240,
+        128
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $('Start').first().json;\nconst s = v => (v === undefined || v === null || String(v).trim() === '' ? null : String(v).trim());\nif (!s(input.name)) throw new Error('name is required');\nconst params = { name: s(input.name) };\nconst statement = \"MATCH (c:Card) WHERE toLower(c.name) CONTAINS toLower($name)\\nWITH c ORDER BY CASE WHEN toLower(c.name) = toLower($name) THEN 0 ELSE 1 END, size(c.name)\\nLIMIT 1\\nOPTIONAL MATCH (c)-[:HAS_KEYWORD]->(k:Keyword)\\nOPTIONAL MATCH (k)-[:DEFINED_BY]->(r:Rule)-[:HAS_CHUNK]->(rch:RuleChunk)\\nWITH c, collect(DISTINCT {keyword: k.name, rule: r.number, rule_text: left(rch.text, 900)}) AS kws\\nOPTIONAL MATCH (c)-[:HAS_RULINGS]->(rc:RulingChunk)\\nOPTIONAL MATCH (c)-[:PRINTED_IN]->(s:Set)\\nOPTIONAL MATCH (c)-[:LEGAL_IN]->(f:Format)\\nRETURN c.name AS name, c.mana_cost AS mana_cost, c.mana_value AS mana_value, c.type_line AS type_line,\\n       c.oracle_text AS oracle_text, c.power AS power, c.toughness AS toughness,\\n       [x IN kws WHERE x.keyword IS NOT NULL] AS keywords,\\n       rc.text AS rulings,\\n       collect(DISTINCT s.name) AS sets,\\n       collect(DISTINCT f.name) AS legal_in,\\n       c.scryfall_uri AS source\";\nreturn [{ json: { statements: [{ statement, parameters: params }] } }];\n"
+      },
+      "id": "9c76a01e-5456-431b-85ad-93ff16088d86",
+      "name": "Build query",
+      "position": [
+        480,
+        0
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.neo4j_url }}/db/{{ $('Config').first().json.neo4j_db }}/tx/commit",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "b57f7edb-0e65-48cc-94a2-787a5fd93c53",
+      "name": "Neo4j: query",
+      "position": [
+        720,
+        128
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "bcmktgaXWGWFyyx6",
+          "name": "Neo4j Local"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turns the Neo4j HTTP response into plain objects for the agent.\nconst res = $input.first().json;\nif (res.errors?.length) throw new Error('Neo4j error: ' + JSON.stringify(res.errors));\nconst r = res.results[0];\nlet rows = r.data.map(d => Object.fromEntries(r.columns.map((c, i) => [c, d.row[i]])));\nif (rows.length && 'score' in rows[0]) rows.sort((a, b) => b.score - a.score);\nreturn [{ json: { count: rows.length, results: rows } }];\n"
+      },
+      "id": "b8655f61-f9bc-4ca0-8d6e-793b63af56f7",
+      "name": "Format result",
+      "position": [
+        960,
+        0
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    }
+  ],
+  "pinData": {
+    "Start": [
+      {
+        "json": {
+          "name": "Fog Bank"
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Start": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Build query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build query": {
+      "main": [
+        [
+          {
+            "node": "Neo4j: query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Neo4j: query": {
+      "main": [
+        [
+          {
+            "node": "Format result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "521d8e8c-8dde-4d1a-9705-ec08bfbae9e0",
+  "meta": {
+    "instanceId": "2e9c9501df3fd0f4eebf9dce3f5b602ad2290cf435f1b64b869057ca43185f61"
+  },
+  "nodeGroups": [],
+  "id": "cSjW4wt0ZQVwXbdO",
+  "tags": []
+}

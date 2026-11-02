@@ -1,0 +1,645 @@
+{
+  "name": "MTG RAG 02 - Ingest cards and rulings (Scryfall)",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "3f28ed14-4a12-4fee-916c-381dac15a267",
+      "name": "Manual trigger",
+      "position": [
+        0,
+        0
+      ],
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "jsCode": "// Config: edit these values once. Every other node reads them via $('Config').first().json\n// If n8n runs in Docker and Neo4j/Ollama run on the host, use host.docker.internal.\n// If n8n runs directly on Windows (npm / desktop), use localhost.\nreturn [{\n  json: {\n    neo4j_url: 'http://host.docker.internal:7474',\n    neo4j_db: 'neo4j',\n    ollama_url: 'http://host.docker.internal:11434',\n    embed_model: 'nomic-embed-text',\n    // Scryfall set code(s) to ingest. One set is ~250-300 cards. Space separated for several: 'fdn dsk'\n    set_codes: 'fdn',\n    // Paste the current TXT link from https://magic.wizards.com/en/rules\n    cr_url: 'PASTE_COMPREHENSIVE_RULES_TXT_URL_HERE',\n  },\n}];\n"
+      },
+      "id": "c2a2bc9d-aaff-4125-be8b-44d5b6f1603e",
+      "name": "Config",
+      "position": [
+        240,
+        128
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "url": "={{ 'https://api.scryfall.com/cards/search?unique=cards&q=' + encodeURIComponent('(' + $('Config').first().json.set_codes.trim().split(/\\s+/).map(s => 'set:' + s).join(' or ') + ')') }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "KEA-MTG-RAG/1.0 (school project)"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "pagination": {
+            "pagination": {
+              "paginationMode": "responseContainsNextURL",
+              "nextURL": "={{ $response.body.next_page }}",
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.has_more }}",
+              "requestInterval": 150
+            }
+          }
+        }
+      },
+      "id": "d48849a8-1d69-4350-9394-1409c4b8e240",
+      "name": "Scryfall: search cards",
+      "position": [
+        480,
+        0
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "notesInFlow": true,
+      "notes": "Paginated, 175 cards per page"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Input: Scryfall /cards/search pages (one item per page, cards in .data[])\n// Output: one item per unique card (oracle_id), flattened for the graph import.\nconst SUPERTYPES = new Set(['Basic', 'Legendary', 'Ongoing', 'Snow', 'World']);\nconst FORMATS = ['standard', 'pioneer', 'modern', 'legacy', 'vintage', 'commander', 'pauper'];\n\nconst cards = $input.all().flatMap(i => (Array.isArray(i.json.data) ? i.json.data : []));\nconst seen = new Set();\nconst out = [];\n\nfor (const c of cards) {\n  if (!c.oracle_id || seen.has(c.oracle_id)) continue;\n  seen.add(c.oracle_id);\n\n  // Double-faced, split and adventure cards keep their text in card_faces\n  const faces = Array.isArray(c.card_faces) && c.card_faces.length ? c.card_faces : [c];\n\n  const supertypes = new Set();\n  const types = new Set();\n  const subtypes = new Set();\n  for (const f of faces) {\n    const [left, right = ''] = String(f.type_line ?? c.type_line ?? '').split(' — ');\n    for (const w of left.trim().split(/\\s+/).filter(Boolean)) (SUPERTYPES.has(w) ? supertypes : types).add(w);\n    for (const w of right.trim().split(/\\s+/).filter(Boolean)) subtypes.add(w);\n  }\n\n  const pt = faces.find(f => f.power != null);\n  const colors = c.colors ?? [...new Set(faces.flatMap(f => f.colors ?? []))];\n\n  out.push({\n    json: {\n      oracle_id: c.oracle_id,\n      scryfall_id: c.id,\n      name: c.name,\n      mana_cost: c.mana_cost ?? faces.map(f => f.mana_cost ?? '').join(' // '),\n      mana_value: c.cmc ?? 0,\n      type_line: c.type_line ?? faces.map(f => f.type_line).join(' // '),\n      oracle_text: faces.map(f => f.oracle_text ?? '').filter(Boolean).join('\\n//\\n'),\n      power: pt?.power ?? null,\n      toughness: pt?.toughness ?? null,\n      loyalty: faces.find(f => f.loyalty != null)?.loyalty ?? null,\n      rarity: c.rarity,\n      colors,\n      color_identity: c.color_identity ?? [],\n      supertypes: [...supertypes],\n      types: [...types],\n      subtypes: [...subtypes],\n      keywords: c.keywords ?? [],\n      set_code: c.set,\n      set_name: c.set_name,\n      legal_formats: FORMATS.filter(f => ['legal', 'restricted'].includes(c.legalities?.[f])),\n      scryfall_uri: c.scryfall_uri,\n    },\n  });\n}\n\nif (!out.length) throw new Error('No cards returned from Scryfall - check set_codes in Config');\nreturn out;\n"
+      },
+      "id": "9b85cc79-f87f-4360-b59f-2e9e9705f472",
+      "name": "Normalize cards",
+      "position": [
+        720,
+        128
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "jsCode": "// Wraps card rows in Neo4j HTTP transaction bodies (UNWIND batches of 100).\nconst STATEMENT = \"UNWIND $rows AS row\\nMERGE (c:Card {oracle_id: row.oracle_id})\\nSET c.name = row.name, c.mana_cost = row.mana_cost, c.mana_value = row.mana_value,\\n    c.type_line = row.type_line, c.oracle_text = row.oracle_text,\\n    c.power = row.power, c.toughness = row.toughness, c.loyalty = row.loyalty,\\n    c.rarity = row.rarity, c.scryfall_uri = row.scryfall_uri\\nMERGE (s:Set {code: row.set_code}) SET s.name = row.set_name\\nMERGE (c)-[:PRINTED_IN]->(s)\\nFOREACH (x IN row.colors         | MERGE (n:Color {code: x})     MERGE (c)-[:HAS_COLOR]->(n))\\nFOREACH (x IN row.color_identity | MERGE (n:Color {code: x})     MERGE (c)-[:HAS_COLOR_IDENTITY]->(n))\\nFOREACH (x IN row.supertypes     | MERGE (n:Supertype {name: x}) MERGE (c)-[:HAS_SUPERTYPE]->(n))\\nFOREACH (x IN row.types          | MERGE (n:CardType {name: x})  MERGE (c)-[:IS_TYPE]->(n))\\nFOREACH (x IN row.subtypes       | MERGE (n:Subtype {name: x})   MERGE (c)-[:HAS_SUBTYPE]->(n))\\nFOREACH (x IN row.keywords       | MERGE (n:Keyword {name: x})   MERGE (c)-[:HAS_KEYWORD]->(n))\\nFOREACH (x IN row.legal_formats  | MERGE (n:Format {name: x})    MERGE (c)-[:LEGAL_IN]->(n))\";\nconst BATCH = 100;\n\nconst rows = $input.all().map(i => i.json);\nconst out = [];\nfor (let i = 0; i < rows.length; i += BATCH) {\n  out.push({ json: { statements: [{ statement: STATEMENT, parameters: { rows: rows.slice(i, i + BATCH) } }] } });\n}\nreturn out;\n"
+      },
+      "id": "75023516-bd87-4ad2-87a7-089a713da4e7",
+      "name": "Build card graph batches",
+      "position": [
+        960,
+        0
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.neo4j_url }}/db/{{ $('Config').first().json.neo4j_db }}/tx/commit",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "ab1926ec-e41c-4635-886f-84a9624f2631",
+      "name": "Neo4j: upsert cards",
+      "position": [
+        1200,
+        128
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "notesInFlow": true,
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "bcmktgaXWGWFyyx6",
+          "name": "Neo4j Local"
+        }
+      },
+      "notes": "Card graph"
+    },
+    {
+      "parameters": {
+        "jsCode": "// The Neo4j HTTP API returns 200 even when Cypher fails, so fail loudly here.\nfor (const item of $input.all()) {\n  const errors = item.json.errors ?? [];\n  if (errors.length) throw new Error('Neo4j error: ' + JSON.stringify(errors));\n}\nreturn [{ json: { ok: true, batches: $input.all().length } }];\n"
+      },
+      "id": "ee890aab-5be9-42e2-9d12-fd07368de774",
+      "name": "Check cards import",
+      "position": [
+        1440,
+        0
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "jsCode": "// Continue with the normalized cards (one item per card) after the graph import.\nreturn $('Normalize cards').all().map(i => ({ json: i.json }));\n"
+      },
+      "id": "4731fa2d-e6d0-449f-87c8-5a11affe9fc5",
+      "name": "Back to cards",
+      "position": [
+        1680,
+        128
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "url": "=https://api.scryfall.com/cards/{{ $json.scryfall_id }}/rulings",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "KEA-MTG-RAG/1.0 (school project)"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 120
+            }
+          }
+        }
+      },
+      "id": "9b3b9dd9-490a-476b-89a2-6e855f054819",
+      "name": "Scryfall: rulings",
+      "position": [
+        1920,
+        0
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "notesInFlow": true,
+      "retryOnFail": true,
+      "waitBetweenTries": 3000,
+      "notes": "1 request per card, 120 ms apart (Scryfall rate limit)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Builds one chunk per card and one chunk per card's rulings.\n// Input: responses from Scryfall /cards/{id}/rulings, in the same order as 'Normalize cards'.\nfunction fnv1a(str) {\n  let h = 0x811c9dc5;\n  for (let i = 0; i < str.length; i++) {\n    h ^= str.charCodeAt(i);\n    h = Math.imul(h, 0x01000193) >>> 0;\n  }\n  return h.toString(16).padStart(8, '0');\n}\n\nconst cards = $('Normalize cards').all().map(i => i.json);\nconst rulings = $input.all().map(i => i.json);\nconst out = [];\n\ncards.forEach((c, idx) => {\n  const stats = c.power != null ? `${c.power}/${c.toughness}` : c.loyalty != null ? `Loyalty ${c.loyalty}` : null;\n  const cardText = [\n    `${c.name} ${c.mana_cost ?? ''}`.trim(),\n    c.type_line,\n    c.oracle_text,\n    stats,\n    `Set: ${c.set_name} (${String(c.set_code).toUpperCase()})`,\n  ].filter(Boolean).join('\\n');\n\n  out.push({\n    json: {\n      chunk_id: `card:${c.oracle_id}`,\n      source_type: 'card',\n      parent_id: c.oracle_id,\n      text: cardText,\n      hash: fnv1a(cardText),\n      source: `Scryfall: ${c.name} (${c.scryfall_uri})`,\n    },\n  });\n\n  const list = Array.isArray(rulings[idx]?.data) ? rulings[idx].data : [];\n  if (list.length) {\n    const rulingText = [`Official rulings for ${c.name}:`, ...list.map(r => `- (${r.published_at}) ${r.comment}`)].join('\\n');\n    out.push({\n      json: {\n        chunk_id: `rulings:${c.oracle_id}`,\n        source_type: 'ruling',\n        parent_id: c.oracle_id,\n        text: rulingText,\n        hash: fnv1a(rulingText),\n        source: `Scryfall rulings: ${c.name} (${c.scryfall_uri})`,\n      },\n    });\n  }\n});\n\nreturn out;\n"
+      },
+      "id": "124e4c35-7fc1-47b8-898d-8c470f1248f6",
+      "name": "Build card chunks",
+      "position": [
+        2160,
+        128
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "notesInFlow": true,
+      "notes": "card + rulings chunks"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Duplicate check: ask Neo4j which chunks already exist and with which content hash.\nconst ids = $input.all().map(i => i.json.chunk_id);\nreturn [{\n  json: {\n    statements: [{\n      statement: 'MATCH (ch:Chunk) WHERE ch.id IN $ids RETURN ch.id AS id, ch.hash AS hash',\n      parameters: { ids },\n    }],\n  },\n}];\n"
+      },
+      "id": "3b64df71-8c63-490d-9c89-2ba54e0dbdc7",
+      "name": "Build hash query",
+      "position": [
+        2400,
+        0
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.neo4j_url }}/db/{{ $('Config').first().json.neo4j_db }}/tx/commit",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "838f5b64-65b7-4f51-aa61-a1df14506dcc",
+      "name": "Neo4j: existing hashes",
+      "position": [
+        2640,
+        128
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "notesInFlow": true,
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "bcmktgaXWGWFyyx6",
+          "name": "Neo4j Local"
+        }
+      },
+      "notes": "Duplicate check"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Keep only new chunks or chunks whose text changed. Unchanged chunks are not re-embedded.\nconst res = $input.first().json;\nif (res.errors?.length) throw new Error('Neo4j error: ' + JSON.stringify(res.errors));\nconst existing = new Map((res.results?.[0]?.data ?? []).map(d => [d.row[0], d.row[1]]));\n\nconst chunks = $(\"Build card chunks\").all().map(i => i.json);\nconst changed = chunks.filter(c => existing.get(c.chunk_id) !== c.hash);\nconst skipped = chunks.length - changed.length;\nconsole.log(`Chunks: ${chunks.length}, unchanged (skipped): ${skipped}, to embed: ${changed.length}`);\nreturn changed.map(c => ({ json: c }));\n"
+      },
+      "id": "a327689b-d25f-40c5-87e1-eb42f0001cef",
+      "name": "Filter changed chunks",
+      "position": [
+        2880,
+        0
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "notesInFlow": true,
+      "notes": "Skips chunks whose hash is unchanged"
+    },
+    {
+      "parameters": {
+        "jsCode": "// 32 texts per request instead of one request per chunk.\n// n8n's HTTP node fires all items concurrently by default, which floods Ollama\n// (requests queue up and Docker's proxy starts refusing connections).\nconst BATCH = 32;\nconst chunks = $input.all().map(i => i.json);\nconst out = [];\nfor (let i = 0; i < chunks.length; i += BATCH) {\n  out.push({ json: { inputs: chunks.slice(i, i + BATCH).map(c => 'search_document: ' + c.text) } });\n}\nreturn out;\n"
+      },
+      "id": "95b3676b-b30e-481c-bdd8-509cfd51ffa9",
+      "name": "Batch for embedding",
+      "position": [
+        3120,
+        128
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "notesInFlow": true,
+      "notes": "32 texts per request"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.ollama_url }}/api/embed",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $('Config').first().json.embed_model, input: $json.inputs }) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 0
+            }
+          }
+        }
+      },
+      "id": "ad34aba7-0f8f-4f3b-9cd7-931210228c2b",
+      "name": "Ollama: embed",
+      "position": [
+        3360,
+        0
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "notesInFlow": true,
+      "notes": "One request at a time"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Each Ollama response holds up to 32 embeddings; flatten them back onto the chunks in order.\nconst chunks = $('Filter changed chunks').all().map(i => i.json);\nconst embeddings = $input.all().flatMap(i => i.json.embeddings ?? []);\nif (embeddings.length !== chunks.length) {\n  throw new Error(`Got ${embeddings.length} embeddings for ${chunks.length} chunks`);\n}\nreturn chunks.map((c, idx) => ({ json: { ...c, embedding: embeddings[idx] } }));\n"
+      },
+      "id": "04bf9250-bb35-4aaf-b1ad-7d7dc903c923",
+      "name": "Attach embeddings",
+      "position": [
+        3600,
+        128
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "jsCode": "// Upserts chunks with their embedding. Label and parent link depend on the chunk type.\nconst BASE = \"UNWIND $rows AS row\\nMERGE (ch:Chunk {id: row.chunk_id})\\nSET ch:__LABEL__, ch.text = row.text, ch.source = row.source,\\n    ch.source_type = row.source_type, ch.hash = row.hash, ch.embedding = row.embedding\\nWITH ch, row\\n__LINK__\";\nconst LABEL = { card: 'CardChunk', ruling: 'RulingChunk', rule: 'RuleChunk' };\nconst LINK = {\n  card: 'MATCH (p:Card {oracle_id: row.parent_id}) MERGE (p)-[:HAS_CHUNK]->(ch)',\n  ruling: 'MATCH (p:Card {oracle_id: row.parent_id}) MERGE (p)-[:HAS_RULINGS]->(ch)',\n  rule: 'MATCH (p:Rule {number: row.parent_id}) MERGE (p)-[:HAS_CHUNK]->(ch)',\n};\nconst BATCH = 50;\n\nconst byType = {};\nfor (const { json: c } of $input.all()) {\n  (byType[c.source_type] ??= []).push({\n    chunk_id: c.chunk_id, parent_id: c.parent_id, source_type: c.source_type,\n    text: c.text, hash: c.hash, source: c.source, embedding: c.embedding,\n  });\n}\n\nconst out = [];\nfor (const [type, rows] of Object.entries(byType)) {\n  const statement = BASE.replace('__LABEL__', LABEL[type]).replace('__LINK__', LINK[type]);\n  for (let i = 0; i < rows.length; i += BATCH) {\n    out.push({ json: { statements: [{ statement, parameters: { rows: rows.slice(i, i + BATCH) } }] } });\n  }\n}\nreturn out;\n"
+      },
+      "id": "625ee475-200e-4b27-8a20-5155004c31c7",
+      "name": "Build chunk batches",
+      "position": [
+        3840,
+        0
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.neo4j_url }}/db/{{ $('Config').first().json.neo4j_db }}/tx/commit",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "382bf56b-01b5-48b0-8fc8-8f567f87882a",
+      "name": "Neo4j: upsert chunks",
+      "position": [
+        4080,
+        128
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "notesInFlow": true,
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "bcmktgaXWGWFyyx6",
+          "name": "Neo4j Local"
+        }
+      },
+      "notes": "Chunk + vector"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Links Keyword nodes (from Scryfall) to the Comprehensive Rule that defines them (701.x / 702.x).\nfor (const item of $input.all()) {\n  if (item.json.errors?.length) throw new Error('Neo4j error: ' + JSON.stringify(item.json.errors));\n}\nreturn [{ json: { statements: [{ statement: \"MATCH (k:Keyword)\\nMATCH (r:Rule {level: 'rule'})\\nWHERE r.section IN ['701', '702'] AND toLower(r.title) = toLower(k.name)\\nMERGE (k)-[:DEFINED_BY]->(r)\\nRETURN count(*) AS linked\", parameters: {} }] } }];\n"
+      },
+      "id": "9365187f-a9e1-4c66-830e-fd3865a7e811",
+      "name": "Build keyword links",
+      "position": [
+        4320,
+        0
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.neo4j_url }}/db/{{ $('Config').first().json.neo4j_db }}/tx/commit",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "8e5217aa-8610-4eb7-b3ac-42550e6d2424",
+      "name": "Neo4j: link keywords",
+      "position": [
+        4560,
+        128
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "notesInFlow": true,
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "bcmktgaXWGWFyyx6",
+          "name": "Neo4j Local"
+        }
+      },
+      "notes": "Keyword -[:DEFINED_BY]-> Rule"
+    },
+    {
+      "parameters": {
+        "jsCode": "// The Neo4j HTTP API returns 200 even when Cypher fails, so fail loudly here.\nfor (const item of $input.all()) {\n  const errors = item.json.errors ?? [];\n  if (errors.length) throw new Error('Neo4j error: ' + JSON.stringify(errors));\n}\nreturn [{ json: { ok: true, batches: $input.all().length } }];\n"
+      },
+      "id": "ade56a01-7f40-4267-b972-5db211ed0c5c",
+      "name": "Check result",
+      "position": [
+        4800,
+        0
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Manual trigger": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Scryfall: search cards",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scryfall: search cards": {
+      "main": [
+        [
+          {
+            "node": "Normalize cards",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize cards": {
+      "main": [
+        [
+          {
+            "node": "Build card graph batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build card graph batches": {
+      "main": [
+        [
+          {
+            "node": "Neo4j: upsert cards",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Neo4j: upsert cards": {
+      "main": [
+        [
+          {
+            "node": "Check cards import",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check cards import": {
+      "main": [
+        [
+          {
+            "node": "Back to cards",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Back to cards": {
+      "main": [
+        [
+          {
+            "node": "Scryfall: rulings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scryfall: rulings": {
+      "main": [
+        [
+          {
+            "node": "Build card chunks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build card chunks": {
+      "main": [
+        [
+          {
+            "node": "Build hash query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build hash query": {
+      "main": [
+        [
+          {
+            "node": "Neo4j: existing hashes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Neo4j: existing hashes": {
+      "main": [
+        [
+          {
+            "node": "Filter changed chunks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter changed chunks": {
+      "main": [
+        [
+          {
+            "node": "Batch for embedding",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Batch for embedding": {
+      "main": [
+        [
+          {
+            "node": "Ollama: embed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama: embed": {
+      "main": [
+        [
+          {
+            "node": "Attach embeddings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach embeddings": {
+      "main": [
+        [
+          {
+            "node": "Build chunk batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build chunk batches": {
+      "main": [
+        [
+          {
+            "node": "Neo4j: upsert chunks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Neo4j: upsert chunks": {
+      "main": [
+        [
+          {
+            "node": "Build keyword links",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build keyword links": {
+      "main": [
+        [
+          {
+            "node": "Neo4j: link keywords",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Neo4j: link keywords": {
+      "main": [
+        [
+          {
+            "node": "Check result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "135dcde2-e89c-42df-abb0-e8d546a2f21f",
+  "meta": {
+    "instanceId": "2e9c9501df3fd0f4eebf9dce3f5b602ad2290cf435f1b64b869057ca43185f61"
+  },
+  "nodeGroups": [],
+  "id": "ApbL8ypOxjxf28au",
+  "tags": []
+}

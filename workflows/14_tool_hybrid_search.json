@@ -1,0 +1,192 @@
+{
+  "name": "MTG RAG tool - hybrid_search (vector + graph)",
+  "nodes": [
+    {
+      "parameters": {
+        "workflowInputs": {
+          "values": [
+            {
+              "name": "query"
+            },
+            {
+              "name": "k",
+              "type": "number"
+            }
+          ]
+        }
+      },
+      "id": "3500ec29-8c44-4909-b8d9-a3316bdb2c82",
+      "name": "Start",
+      "position": [
+        0,
+        0
+      ],
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1
+    },
+    {
+      "parameters": {
+        "jsCode": "// Config: edit these values once. Every other node reads them via $('Config').first().json\n// If n8n runs in Docker and Neo4j/Ollama run on the host, use host.docker.internal.\n// If n8n runs directly on Windows (npm / desktop), use localhost.\nreturn [{\n  json: {\n    neo4j_url: 'http://host.docker.internal:7474',\n    neo4j_db: 'neo4j',\n    ollama_url: 'http://host.docker.internal:11434',\n    embed_model: 'nomic-embed-text',\n    // Scryfall set code(s) to ingest. One set is ~250-300 cards. Space separated for several: 'fdn dsk'\n    set_codes: 'fdn',\n    // Paste the current TXT link from https://magic.wizards.com/en/rules\n    cr_url: 'PASTE_COMPREHENSIVE_RULES_TXT_URL_HERE',\n  },\n}];\n"
+      },
+      "id": "2feb8808-4a49-47e5-8757-17932c2d1b30",
+      "name": "Config",
+      "position": [
+        240,
+        128
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.ollama_url }}/api/embed",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $('Config').first().json.embed_model, input: 'search_query: ' + $('Start').first().json.query }) }}",
+        "options": {}
+      },
+      "id": "383d848b-5d77-4bc1-8ffa-3b22ee17d9ee",
+      "name": "Ollama: embed query",
+      "position": [
+        480,
+        0
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "notesInFlow": true,
+      "notes": "nomic-embed-text expects the 'search_query: ' prefix"
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $('Start').first().json;\nconst k = Math.min(Math.max(parseInt(input.k) || 5, 1), 15);\nconst params = { k, embedding: $input.first().json.embeddings[0] };\nconst statement = \"CALL db.index.vector.queryNodes('rule_chunk_embedding', $k, $embedding) YIELD node AS ch, score\\nMATCH (r:Rule)-[:HAS_CHUNK]->(ch)\\nOPTIONAL MATCH (r)<-[:DEFINED_BY]-(kw:Keyword)\\nOPTIONAL MATCH (kw)<-[:HAS_KEYWORD]-(c:Card)\\nWITH ch, score, r, kw, collect(DISTINCT c.name) AS cards\\nRETURN 'rule' AS kind, r.number + coalesce(' ' + r.title, '') AS name, ch.text AS text, round(score, 3) AS score,\\n       CASE WHEN kw IS NULL THEN [] ELSE ['Cards with ' + kw.name + ' (' + size(cards) + '): '] + cards[0..10] END AS related,\\n       ch.source AS source\\nUNION ALL\\nCALL db.index.vector.queryNodes('card_chunk_embedding', $k, $embedding) YIELD node AS ch, score\\nMATCH (c:Card)-[:HAS_CHUNK]->(ch)\\nOPTIONAL MATCH (c)-[:HAS_KEYWORD]->(kw:Keyword)\\nOPTIONAL MATCH (kw)-[:DEFINED_BY]->(r:Rule)\\nWITH c, ch, score, collect(DISTINCT kw.name + coalesce(' -> rule ' + r.number, '')) AS kws\\nRETURN 'card' AS kind, c.name AS name, ch.text AS text, round(score, 3) AS score,\\n       kws AS related, c.scryfall_uri AS source\";\nreturn [{ json: { statements: [{ statement, parameters: params }] } }];\n"
+      },
+      "id": "7af77f9f-2204-4b0e-9939-de4b6c937ed9",
+      "name": "Build query",
+      "position": [
+        720,
+        128
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.neo4j_url }}/db/{{ $('Config').first().json.neo4j_db }}/tx/commit",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "ee33f6c3-9133-4308-88ea-70abae7fa48e",
+      "name": "Neo4j: query",
+      "position": [
+        960,
+        0
+      ],
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "bcmktgaXWGWFyyx6",
+          "name": "Neo4j Local"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turns the Neo4j HTTP response into plain objects for the agent.\nconst res = $input.first().json;\nif (res.errors?.length) throw new Error('Neo4j error: ' + JSON.stringify(res.errors));\nconst r = res.results[0];\nlet rows = r.data.map(d => Object.fromEntries(r.columns.map((c, i) => [c, d.row[i]])));\nif (rows.length && 'score' in rows[0]) rows.sort((a, b) => b.score - a.score);\nreturn [{ json: { count: rows.length, results: rows } }];\n"
+      },
+      "id": "f15b821b-153e-4559-853e-fb50c9e3bf0f",
+      "name": "Format result",
+      "position": [
+        1200,
+        128
+      ],
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2
+    }
+  ],
+  "pinData": {
+    "Start": [
+      {
+        "json": {
+          "query": "what does deathtouch do",
+          "k": 3
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Start": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Ollama: embed query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama: embed query": {
+      "main": [
+        [
+          {
+            "node": "Build query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build query": {
+      "main": [
+        [
+          {
+            "node": "Neo4j: query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Neo4j: query": {
+      "main": [
+        [
+          {
+            "node": "Format result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "876530d2-b0f0-4a3e-8a6c-87a73b0b9f5a",
+  "meta": {
+    "instanceId": "2e9c9501df3fd0f4eebf9dce3f5b602ad2290cf435f1b64b869057ca43185f61"
+  },
+  "nodeGroups": [],
+  "id": "dU0hQKrGN23bCEjs",
+  "tags": []
+}
